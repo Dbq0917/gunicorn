@@ -70,6 +70,32 @@ def make_request(host, port, path='/'):
         return response
 
 
+def worker_pids(master_pid):
+    """Return the direct children of a gunicorn master."""
+    output = subprocess.check_output(
+        ['ps', '-o', 'pid=', '--ppid', str(master_pid)], text=True)
+    return {int(pid) for pid in output.split()}
+
+
+def wait_for_worker_count(master_pid, count, timeout=CI_TIMEOUT,
+                          previous=None, samples=4):
+    """Wait until exactly ``count`` new workers hold steady."""
+    deadline = time.monotonic() + timeout
+    last, streak = None, 0
+    while time.monotonic() < deadline:
+        pids = worker_pids(master_pid)
+        if (len(pids) == count
+                and (previous is None or not pids & previous)):
+            streak = streak + 1 if pids == last else 1
+            last = pids
+            if streak >= samples:
+                return pids
+        else:
+            last, streak = None, 0
+        time.sleep(0.1)
+    return worker_pids(master_pid)
+
+
 @pytest.fixture
 def app_module(tmp_path):
     """Create a temporary app module."""
@@ -209,6 +235,24 @@ class TestSignalHandlingIntegration:
         assert proc.poll() is None, "Server died after SIGHUP"
         response = make_request('127.0.0.1', port)
         assert b'Hello, World!' in response
+
+    def test_three_sighup_reloads_keep_the_worker_count(self, gunicorn_server):
+        """Each reload hands its listeners to the new workers before retiring
+        the old ones, so repeated rolling restarts must not shrink the pool."""
+        proc, port = gunicorn_server
+        expected = 2
+        assert len(wait_for_worker_count(proc.pid, expected)) == expected
+
+        for _ in range(3):
+            before = worker_pids(proc.pid)
+            proc.send_signal(signal.SIGHUP)
+            after = wait_for_worker_count(proc.pid, expected, previous=before)
+
+            assert proc.poll() is None, "Server died after SIGHUP"
+            assert len(after) == expected
+            assert after != before, "reload did not replace the workers"
+            response = make_request('127.0.0.1', port)
+            assert b'Hello, World!' in response
 
     def test_multiple_requests_under_load(self, gunicorn_server):
         """Verify server handles multiple concurrent requests."""

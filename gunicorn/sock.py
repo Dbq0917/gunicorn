@@ -18,9 +18,10 @@ PLATFORM = sys.platform
 
 class BaseSocket:
 
-    def __init__(self, address, conf, log, fd=None):
+    def __init__(self, address, conf, log, fd=None, reuse_port=None):
         self.log = log
         self.conf = conf
+        self.reuse_port = reuse_port
 
         self.cfg_addr = address
         if fd is None:
@@ -41,7 +42,10 @@ class BaseSocket:
 
     def set_options(self, sock, bound=False):
         sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        if (self.conf.reuse_port
+        reuse_port = self.conf.reuse_port
+        if self.reuse_port is not None:
+            reuse_port = self.reuse_port
+        if (reuse_port
                 and hasattr(socket, 'SO_REUSEPORT')):  # pragma: no cover
             try:
                 sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1)
@@ -137,7 +141,7 @@ class UnixSocket(BaseSocket):
 
     FAMILY = socket.AF_UNIX
 
-    def __init__(self, addr, conf, log, fd=None):
+    def __init__(self, addr, conf, log, fd=None, reuse_port=None):
         # Abstract namespace sockets (address starts with a null byte) have
         # no filesystem presence, so there's nothing to stat or remove.
         if fd is None and not addr.startswith('\0'):
@@ -151,7 +155,7 @@ class UnixSocket(BaseSocket):
                     os.remove(addr)
                 else:
                     raise ValueError("%r is not a socket" % addr)
-        super().__init__(addr, conf, log, fd=fd)
+        super().__init__(addr, conf, log, fd=fd, reuse_port=reuse_port)
 
     def __str__(self):
         return "unix:%s" % self.cfg_addr
@@ -177,13 +181,17 @@ def _sock_type(addr):
     return sock_type
 
 
-def create_sockets(conf, log, fds=None):
+def create_sockets(conf, log, fds=None, reuse_port=None):
     """
     Create a new socket for the configured addresses or file descriptors.
 
     If a configured address is a tuple then a TCP socket is created.
     If it is a string, a Unix socket is created. Otherwise, a TypeError is
     raised.
+
+    ``reuse_port`` overrides the configuration for the bind, which lets a
+    reload create a master-owned listener that can coexist with the workers
+    still using their own ``SO_REUSEPORT`` sockets.
     """
     listeners = []
 
@@ -219,7 +227,10 @@ def create_sockets(conf, log, fds=None):
         sock = None
         for i in range(5):
             try:
-                sock = sock_type(addr, conf, log)
+                if reuse_port is None:
+                    sock = sock_type(addr, conf, log)
+                else:
+                    sock = sock_type(addr, conf, log, reuse_port=reuse_port)
             except OSError as e:
                 if e.args[0] == errno.EADDRINUSE:
                     log.error("Connection in use: %s", str(addr))
@@ -227,7 +238,7 @@ def create_sockets(conf, log, fds=None):
                     log.error("Invalid address: %s", str(addr))
                 msg = "connection to {addr} failed: {error}"
                 log.error(msg.format(addr=str(addr), error=str(e)))
-                if i < 5:
+                if i < 4:
                     log.debug("Retrying in 1 second.")
                     time.sleep(1)
             else:

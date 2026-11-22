@@ -81,6 +81,21 @@ def test_create_sockets_listens_when_acceptconn_unsupported():
     bound_socket.listen.assert_called_once_with(123)
 
 
+def test_create_sockets_reuse_port_override():
+    conf = mock.Mock(address=['127.0.0.1:8000'], certfile=None, keyfile=None,
+                     reuse_port=False)
+    log = mock.Mock()
+    listener = mock.Mock()
+    sock_type = mock.Mock(return_value=listener)
+
+    with mock.patch.object(sock, '_sock_type', return_value=sock_type):
+        listeners = sock.create_sockets(conf, log, reuse_port=True)
+
+    assert listeners == [listener]
+    sock_type.assert_called_once_with('127.0.0.1:8000', conf, log,
+                                      reuse_port=True)
+
+
 def test_socket_close():
     listener1 = mock.Mock()
     listener1.getsockname.return_value = ('127.0.0.1', '80')

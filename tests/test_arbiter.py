@@ -86,6 +86,19 @@ def test_arbiter_stop_does_not_unlink_when_using_reuse_port(close_sockets):
     close_sockets.assert_called_with([], False)
 
 
+@mock.patch('gunicorn.sock.close_sockets')
+def test_arbiter_stop_unlinks_reuse_port_listeners_owned_by_master(
+        close_sockets):
+    """A listener inherited after a reuse_port change still owns its path."""
+    arbiter = gunicorn.arbiter.Arbiter(DummyApplication())
+    arbiter.cfg.settings['reuse_port'] = ReusePort()
+    arbiter.cfg.settings['reuse_port'].set(True)
+    listeners = [mock.Mock()]
+    arbiter.LISTENERS = listeners
+    arbiter.stop()
+    close_sockets.assert_called_with(listeners, True)
+
+
 @mock.patch('os.getpid')
 @mock.patch('os.fork')
 @mock.patch('os.execvpe')
@@ -316,13 +329,13 @@ class TestSignalHandlerRegistration:
 
             # Find the handler for SIGCHLD - uses signal_chld for async-signal-safety
             sigchld_calls = [c for c in mock_signal.call_args_list
-                            if c[0][0] == signal.SIGCHLD]
+                             if c[0][0] == signal.SIGCHLD]
             assert len(sigchld_calls) == 1
             assert sigchld_calls[0][0][1] == arbiter.signal_chld
 
             # Find handlers for other signals
             other_calls = [c for c in mock_signal.call_args_list
-                          if c[0][0] in arbiter.SIGNALS]
+                           if c[0][0] in arbiter.SIGNALS]
             for call in other_calls:
                 assert call[0][1] == arbiter.signal
 
@@ -647,6 +660,71 @@ class TestSighupReload:
         mock_manage.assert_called_once()
 
     @mock.patch('gunicorn.arbiter.Arbiter.spawn_worker')
+    @mock.patch('gunicorn.sock.create_sockets')
+    def test_reload_enabling_reuse_port_keeps_inherited_listeners(
+            self, mock_create, mock_spawn):
+        """A live master listener cannot be rebound with SO_REUSEPORT.
+
+        The workers replacing the old ones have to inherit those handles.
+        """
+        app = ReloadableConfigApplication()
+        app.settings_override = {'reuse_port': False}
+        arbiter = gunicorn.arbiter.Arbiter(app)
+        listener = mock.Mock()
+        arbiter.LISTENERS = [listener]
+        arbiter.pidfile = None
+
+        app.settings_override = {'reuse_port': True}
+        arbiter.reload()
+
+        assert arbiter.LISTENERS == [listener]
+        assert arbiter._inherited_listeners is True
+        mock_create.assert_not_called()
+
+    @mock.patch('gunicorn.arbiter.Arbiter.spawn_worker')
+    @mock.patch('gunicorn.sock.create_sockets')
+    def test_reload_disabling_reuse_port_creates_shared_listener(
+            self, mock_create, mock_spawn):
+        """The replacement workers need a master-owned socket to inherit."""
+        app = ReloadableConfigApplication()
+        app.settings_override = {'reuse_port': True}
+        arbiter = gunicorn.arbiter.Arbiter(app)
+        arbiter.cfg.settings['reuse_port'].set(True)
+        arbiter.LISTENERS = []
+        arbiter.pidfile = None
+        listener = mock.Mock()
+        mock_create.return_value = [listener]
+
+        app.settings_override = {'reuse_port': False}
+        arbiter.reload()
+
+        mock_create.assert_called_once_with(arbiter.cfg, arbiter.log,
+                                            reuse_port=True)
+        assert arbiter.LISTENERS == [listener]
+        assert arbiter._inherited_listeners is True
+
+    @mock.patch('gunicorn.arbiter.Arbiter.spawn_worker')
+    @mock.patch('gunicorn.sock.create_sockets')
+    def test_reload_with_reuse_port_creates_master_listener(
+            self, mock_create, mock_spawn):
+        """A reload hands one reuse-port listener to all replacement workers."""
+        app = ReloadableConfigApplication()
+        app.settings_override = {'reuse_port': True}
+        arbiter = gunicorn.arbiter.Arbiter(app)
+        arbiter.cfg.settings['reuse_port'].set(True)
+        arbiter.LISTENERS = []
+        arbiter.pidfile = None
+        listener = mock.Mock()
+        mock_create.return_value = [listener]
+
+        arbiter.reload()
+
+        mock_create.assert_called_once_with(arbiter.cfg, arbiter.log,
+                                            reuse_port=True)
+        assert arbiter.LISTENERS == [listener]
+        assert arbiter._inherited_listeners is True
+
+    @mock.patch('gunicorn.arbiter.Arbiter.spawn_worker')
     @mock.patch('gunicorn.arbiter.Arbiter.manage_workers')
     def test_reload_logs_hang_up(self, mock_manage, mock_spawn):
         """Verify that handle_hup logs the hang up message."""
@@ -784,6 +862,52 @@ class TestWorkerLifecycle:
         assert pid == 12345
         assert 12345 in arbiter.WORKERS
         assert arbiter.WORKERS[12345].age == arbiter.worker_age
+
+    @mock.patch('gunicorn.sock.create_sockets')
+    @mock.patch('os.fork')
+    def test_spawn_worker_uses_inherited_listeners_for_reuse_port(
+            self, mock_fork, mock_create):
+        """A reuse_port child uses the master handles instead of rebinding."""
+        mock_fork.return_value = 0
+        arbiter = gunicorn.arbiter.Arbiter(DummyApplication())
+        arbiter.cfg.settings['reuse_port'].set(True)
+        listener = mock.Mock()
+        arbiter.LISTENERS = [listener]
+        arbiter._inherited_listeners = True
+        arbiter.pid = None
+        worker = mock.Mock(sockets=arbiter.LISTENERS)
+        arbiter.worker_class = mock.Mock(return_value=worker)
+
+        with pytest.raises(SystemExit) as exc:
+            arbiter.spawn_worker()
+
+        assert exc.value.code == 0
+        mock_create.assert_not_called()
+        assert worker.sockets is arbiter.LISTENERS
+        worker.init_process.assert_called_once_with()
+
+    @mock.patch('gunicorn.sock.create_sockets')
+    @mock.patch('os.fork')
+    def test_spawn_worker_falls_back_to_inherited_listeners(
+            self, mock_fork, mock_create):
+        """A failed reuse_port bind must not take the replacement worker down."""
+        mock_fork.return_value = 0
+        mock_create.side_effect = SystemExit(1)
+        arbiter = gunicorn.arbiter.Arbiter(DummyApplication())
+        arbiter.cfg.settings['reuse_port'].set(True)
+        listener = mock.Mock()
+        arbiter.LISTENERS = [listener]
+        arbiter.pid = None
+        worker = mock.Mock(sockets=arbiter.LISTENERS)
+        arbiter.worker_class = mock.Mock(return_value=worker)
+
+        with pytest.raises(SystemExit) as exc:
+            arbiter.spawn_worker()
+
+        assert exc.value.code == 0
+        mock_create.assert_called_once_with(arbiter.cfg, arbiter.log)
+        assert worker.sockets is arbiter.LISTENERS
+        worker.init_process.assert_called_once_with()
 
     def test_kill_worker_sends_signal(self):
         """Verify that kill_worker sends the specified signal."""

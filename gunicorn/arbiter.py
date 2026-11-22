@@ -56,6 +56,12 @@ class Arbiter:
         self._num_workers = None
         self._last_logged_active_worker_count = None
         self.log = None
+        # True when the master owns the listeners that workers use while
+        # reuse_port is configured. Reuse-port workers normally bind their own
+        # sockets; a reload that changes reuse_port cannot do that safely while
+        # the old workers still hold the address, so they inherit the master's
+        # sockets instead.
+        self._inherited_listeners = False
 
         # Signal queue - SimpleQueue is reentrant-safe for signal handlers
         self.SIG_QUEUE = queue.SimpleQueue()
@@ -449,7 +455,7 @@ class Arbiter:
         unlink = (
             self.reexec_pid == self.master_pid == 0
             and not self.systemd
-            and not self.cfg.reuse_port
+            and (not self.cfg.reuse_port or bool(self.LISTENERS))
         )
         sock.close_sockets(self.LISTENERS, unlink)
 
@@ -532,6 +538,7 @@ class Arbiter:
         self._stats['reloads'] += 1
 
         old_address = self.cfg.address
+        old_reuse_port = self.cfg.reuse_port
 
         # reset old environment
         for k in self.cfg.env:
@@ -562,6 +569,40 @@ class Arbiter:
             self.LISTENERS = sock.create_sockets(self.cfg, self.log)
             listeners_str = ",".join([str(lnr) for lnr in self.LISTENERS])
             self.log.info("Listening at: %s", listeners_str)
+            if self.cfg.reuse_port:
+                self._inherited_listeners = True
+        elif old_reuse_port and not self.cfg.reuse_port and not self.LISTENERS:
+            # The old workers own their SO_REUSEPORT sockets, while the new
+            # configuration expects a shared master listener. Create that
+            # listener with SO_REUSEPORT so it can coexist with the workers
+            # that are still accepting connections, then hand it to the new
+            # workers. The new workers inherit it from here on.
+            self.LISTENERS = sock.create_sockets(
+                self.cfg, self.log, reuse_port=True)
+            self._inherited_listeners = True
+            listeners_str = ",".join([str(lnr) for lnr in self.LISTENERS])
+            self.log.info("Listening at: %s", listeners_str)
+        elif not old_reuse_port and self.cfg.reuse_port and self.LISTENERS:
+            # The old workers inherited the master's sockets. Binding the same
+            # address again would fail unless every socket opted into
+            # SO_REUSEPORT, so keep the working handles for the new workers.
+            self._inherited_listeners = True
+        elif self.cfg.reuse_port and not self.LISTENERS:
+            # Every old worker owns a SO_REUSEPORT socket, so the master can
+            # bind one more and hand it to the new workers. They then accept
+            # from that shared listener while the old workers finish, instead
+            # of each replacement binding the fixed address on its own.
+            try:
+                self.LISTENERS = sock.create_sockets(
+                    self.cfg, self.log, reuse_port=True)
+            except (OSError, SystemExit):
+                # Leave the workers to bind as before if the handover
+                # listener cannot be created.
+                self.LISTENERS = []
+            else:
+                self._inherited_listeners = True
+                listeners_str = ",".join([str(lnr) for lnr in self.LISTENERS])
+                self.log.info("Listening at: %s", listeners_str)
 
         # do some actions on reload
         self.cfg.on_reload(self)
@@ -747,7 +788,19 @@ class Arbiter:
             util._setproctitle("worker [%s]" % self.proc_name)
             self.log.info("Booting worker with pid: %s", worker.pid)
             if self.cfg.reuse_port and hasattr(socket, "SO_REUSEPORT"):
-                worker.sockets = sock.create_sockets(self.cfg, self.log)
+                if self._inherited_listeners and self.LISTENERS:
+                    worker.sockets = self.LISTENERS
+                elif self.LISTENERS:
+                    try:
+                        worker.sockets = sock.create_sockets(
+                            self.cfg, self.log)
+                    except (OSError, SystemExit):
+                        self.log.warning(
+                            "Cannot bind reuse_port listener; using the "
+                            "listeners inherited from the master")
+                        worker.sockets = self.LISTENERS
+                else:
+                    worker.sockets = sock.create_sockets(self.cfg, self.log)
             self.cfg.post_fork(self, worker)
             worker.init_process()
             sys.exit(0)

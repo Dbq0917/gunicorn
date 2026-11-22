@@ -48,6 +48,11 @@ Gunicorn reloads its settings, starts new workers, and gracefully shuts down the
 previous ones. If the app is not preloaded it reloads the application module as
 well.
 
+A reload that changes [`reuse_port`](reference/settings.md#reuse_port) keeps the
+listening handles in use: the new workers inherit them, and a listener
+compatible with the old `SO_REUSEPORT` workers is created before those workers
+are retired.
+
 <span id="binary-upgrade"></span>
 ## Upgrading to a new binary on the fly
 
