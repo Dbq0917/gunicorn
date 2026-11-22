@@ -252,6 +252,10 @@ class ASGIWorker(base.Worker):
                 if self._quick_shutdown:
                     self.log.info("Quick shutdown requested")
                     break
+                # Draining is not hanging: without a heartbeat the arbiter
+                # kills the worker once ``timeout`` expires, cutting the
+                # requests this wait is meant to let finish.
+                self.notify()
                 await asyncio.sleep(0.1)
 
             if self.nr_conns > 0:
